@@ -1,7 +1,13 @@
-
 name: 🔄 Switch Builds
 
-on: [push, pull_request]
+# === 补丁 0：加上 workflow_dispatch（手动运行按钮）===
+# 原来只有 push / pull_request 两种触发方式。加上 workflow_dispatch 之后，
+# Actions 页面右上角会出现一个 **Run workflow** 按钮 —— 编译失败要改配置重试时，
+# 点一下就能重跑，不用为了触发而去改文件。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 # Global Cache Settings
 env:
