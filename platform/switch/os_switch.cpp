@@ -457,6 +457,12 @@ void OS_Switch::run() {
 		}
 
 		joypad->process();
+		// === 补丁 ===
+		// 3.5.0 缺了这一行：joypad->process() 收集到的手柄事件会一直攒在缓冲区里，
+		// 永远不交给游戏 —— 表现就是「能进游戏、有声音、怎么按都没反应」。
+		// 3.5.1 上游已经修好（platform/switch/os_switch.cpp），这里照抄同一行。
+		input->flush_buffered_events();
+
 
 		swkbdInlineUpdate(&inline_keyboard, NULL);
 
