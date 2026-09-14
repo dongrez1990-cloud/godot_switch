@@ -1,4 +1,6 @@
+
 name: 🔄 Switch Builds
+
 on: [push, pull_request]
 
 # Global Cache Settings
@@ -14,12 +16,15 @@ jobs:
     name: Template (target=release, tools=no)
 
     steps:
-      - uses: actions/checkout@v2
+      # === 补丁 1：actions/checkout@v2 → @v4 ===
+      # 2024 年起 GitHub 下线了 v1/v2 版 artifact/cache 动作，老 workflow 会直接失败。
+      - uses: actions/checkout@v4
 
       # Upload cache on completion and check it out now
       - name: Load .scons_cache directory
         id: switch-template-cache
-        uses: actions/cache@v2
+        # === 补丁 2：actions/cache@v2 → @v4 ===
+        uses: actions/cache@v4
         with:
           path: ${{github.workspace}}/.scons_cache/
           key: ${{github.job}}-${{env.GODOT_BASE_BRANCH}}-${{github.ref}}-${{github.sha}}
@@ -28,20 +33,35 @@ jobs:
             ${{github.job}}-${{env.GODOT_BASE_BRANCH}}-${{github.ref}}
             ${{github.job}}-${{env.GODOT_BASE_BRANCH}}
 
-      - name: Install scons from pip
+      # === 补丁 3：装 scons 多条退路 ===
+      # 原来只有 `pip install scons`。新版发行版有 PEP 668 限制，直接 pip 装会报错，
+      # 所以这里依次尝试：已经有了 → 带 --break-system-packages → 普通装 → 走 apt。
+      - name: Install scons
         run: |
-          sudo apt-get update
-          sudo apt-get -y install python3-pip
-          sudo python3 -m pip install scons
+          set -x
+          command -v scons && scons --version && exit 0
+          python3 -m pip install --break-system-packages scons \
+            || python3 -m pip install scons \
+            || (apt-get update && apt-get -y install scons) \
+            || (sudo apt-get update && sudo apt-get -y install scons)
+          scons --version
 
       - name: Compilation
         env:
           SCONS_CACHE: ${{github.workspace}}/.scons_cache/
+        # === 补丁 4：-j2 → -j4（GitHub 的 runner 有 4 核，原来只用 2 核太慢）===
         run: |
-          scons -j2 verbose=yes warnings=all werror=no platform=switch target=release tools=no
+          scons -j4 verbose=yes warnings=all werror=no platform=switch target=release tools=no
 
-      - uses: actions/upload-artifact@v2
+      - name: Show what was built
+        if: always()
+        run: |
+          echo "--- bin/ ---"
+          ls -la bin/ || true
+
+      # === 补丁 5：actions/upload-artifact@v2 → @v4 ===
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.job }}
+          name: switch-template
           path: bin/*
           retention-days: 14
