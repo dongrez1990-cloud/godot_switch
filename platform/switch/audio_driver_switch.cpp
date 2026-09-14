@@ -28,6 +28,40 @@
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                */
 /*************************************************************************/
 
+// ===========================================================================
+// 本文件是上游 redthing1/godot_switch（分支 3.5-stable_switch）的
+// platform/switch/audio_driver_switch.cpp 的**打过补丁版本**。
+//
+// 改动只有两处，都用 "=== 补丁 ===" 标出，其余与上游逐字节相同。
+//
+// 背景（详见同目录的 README-怎么用.md）：
+//   Switch 上如果音频输出是**蓝牙设备**（蓝牙音箱 / 蓝牙耳机），App 会整个卡死：
+//     * 启动时已连着蓝牙 → 卡在引擎初始化，黑屏，连 Godot 启动画面都出不来
+//     * 运行中连上蓝牙     → 画面冻在最后一帧
+//   有线耳机没有这个问题，音频驱动设成 Dummy 也没有这个问题。
+//
+// 原因（在源码里可以指到行）：
+//   1. init_device() 里 audrenInitialize / audrvCreate / audrvUpdate /
+//      audrenStartAudioRenderer 的返回值**全都只 printf、不检查**。
+//      蓝牙输出时这些调用会失败，但代码继续往下跑，带着一个不可用的渲染器。
+//   2. 音频线程里有一个**没有退出条件的等待循环**：
+//          while (state != Playing) { audrvUpdate(...); }
+//      渲染器不可用时缓冲区永远进不了 Playing → 死循环。
+//      而这个循环**持着 ad->lock()**，于是整个 App 冻住。
+//
+// 补丁做的事（刻意做得最小，不新增成员、不改 .h，方便整文件替换）：
+//   1. 检查那几个返回值；失败就清理并返回 ERR_CANT_OPEN。
+//      Godot 的 AudioDriverManager 在驱动 init 失败时会回退到 Dummy 驱动 ——
+//      于是「启动时连着蓝牙」会变成「App 正常跑、暂时没声音」，而不是死机。
+//   2. 把那个无限等待改成**有上限**的等待。超时就放弃这一块缓冲区继续往下走；
+//      下一轮会因为找不到空闲缓冲区而走到原有的「歇 1ms」分支，不会空转烧 CPU。
+//      设备恢复后音频有机会自己接着走。
+//
+// ⚠ 诚实说明：这个补丁**没有在真机上验证过**（我没有 Switch）。
+//   它保证的是「不再死循环」，不保证「蓝牙下一定有声音」。
+//   请移植版作者 review 后再发布。
+// ===========================================================================
+
 #include "audio_driver_switch.h"
 
 #include "core/os/os.h"
@@ -45,6 +79,15 @@ static const AudioRendererConfig arConfig = {
 	.num_mix_buffers = 2,
 };
 
+// === 补丁 ===
+// 等待缓冲区进入 Playing 状态的最大轮数。
+// 原来这个循环是无限的；现在给它一个上限。
+//
+// 取值理由：正常情况下一两块缓冲区在一个音频帧内就会进入 Playing（几十微秒）。
+// 2000 轮已经远超正常所需，纯粹是「渲染器坏了」和「还没轮到」的分界线。
+// 调大只会让坏掉的时候多转几毫秒，调小则有可能误判。
+#define SWITCH_AUDIO_WAIT_TRIES 2000
+
 Error AudioDriverSwitch::init_device() {
 	int latency = GLOBAL_GET("audio/output_latency");
 	mix_rate = GLOBAL_GET("audio/mix_rate");
@@ -56,8 +99,22 @@ Error AudioDriverSwitch::init_device() {
 
 	Result res = audrenInitialize(&arConfig);
 	printf("audrenInitialize: %x\n", res);
+	// === 补丁 ===
+	// 原来这里不检查返回值。蓝牙作为音频输出时 audrenInitialize 会失败，
+	// 而失败之后下面所有调用都会失败，最后表现成「音频线程死循环 → App 卡死」。
+	// 这里直接报错退出，让引擎回退到 Dummy 驱动（App 能跑，只是没声音）。
+	if (R_FAILED(res)) {
+		audrenExit();
+		return ERR_CANT_OPEN;
+	}
+
 	res = audrvCreate(&audren_driver, &arConfig, 2);
-	printf("audrenInitialize: %x\n", res);
+	printf("audrvCreate: %x\n", res);
+	// === 补丁 ===
+	if (R_FAILED(res)) {
+		audrenExit();
+		return ERR_CANT_OPEN;
+	}
 
 	audren_buffer_size = (sizeof(int16_t) * buffer_size * channels);
 	audren_pool_size = ((audren_buffer_size * 2) + 0xFFF) & ~0xFFF;
@@ -79,9 +136,21 @@ Error AudioDriverSwitch::init_device() {
 
 	res = audrvUpdate(&audren_driver);
 	printf("audrvUpdate: %x\n", res);
+	// === 补丁 ===
+	if (R_FAILED(res)) {
+		audrvClose(&audren_driver);
+		audrenExit();
+		return ERR_CANT_OPEN;
+	}
 
 	res = audrenStartAudioRenderer();
 	printf("audrenStartAudioRenderer: %x\n", res);
+	// === 补丁 ===
+	if (R_FAILED(res)) {
+		audrvClose(&audren_driver);
+		audrenExit();
+		return ERR_CANT_OPEN;
+	}
 
 	audrvVoiceInit(&audren_driver, 0, channels, PcmFormat_Int16, mix_rate);
 	audrvVoiceSetDestinationMix(&audren_driver, 0, AUDREN_FINAL_MIX_ID);
@@ -149,8 +218,24 @@ void AudioDriverSwitch::thread_func(void *p_udata) {
 			}
 			audrvUpdate(&ad->audren_driver);
 			audrenWaitFrame();
+			// === 补丁 ===
+			// 原来这里是：
+			//     while (ad->audren_buffers[free_buffer].state != AudioDriverWaveBufState_Playing) {
+			//         audrvUpdate(&ad->audren_driver);
+			//     }
+			// ——没有任何退出条件。蓝牙音频设备变动后缓冲区永远进不了 Playing，
+			// 于是这里无限循环；而这个循环持着 ad->lock()，整个 App 就冻住了
+			// （真机表现：画面停在最后一帧 / 启动时纯黑屏）。
+			//
+			// 现在给它一个上限：等不到就放弃这一块，继续往下走。
+			// 下一轮会因为没有空闲缓冲区而走原有的「unlock + 歇 1ms + lock」分支，
+			// 所以不会空转烧 CPU；设备恢复之后音频有机会自己接着播。
+			int wait_tries = 0;
 			while (ad->audren_buffers[free_buffer].state != AudioDriverWaveBufState_Playing) {
 				audrvUpdate(&ad->audren_driver);
+				if (++wait_tries >= SWITCH_AUDIO_WAIT_TRIES) {
+					break;
+				}
 			}
 		} else {
 			//printf("aud: no free buffer\n");
